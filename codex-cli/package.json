@@ -52,6 +52,7 @@
     "shell-quote": "^1.8.2",
     "strip-ansi": "^7.1.0",
     "to-rotated": "^1.0.0",
+    "undici": "^7.8.0",
     "use-interval": "1.4.0",
     "zod": "^3.24.3"
   },

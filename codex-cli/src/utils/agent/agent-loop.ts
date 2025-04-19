@@ -7,7 +7,6 @@ import type {
   ResponseItem,
 } from "openai/resources/responses/responses.mjs";
 import type { Reasoning } from "openai/resources.mjs";
-
 import { log, isLoggingEnabled } from "./log.js";
 import { OPENAI_BASE_URL, OPENAI_TIMEOUT_MS } from "../config.js";
 import { parseToolCallArguments } from "../parsers.js";
@@ -41,6 +40,10 @@ export type CommandConfirmation = {
 };
 
 const alreadyProcessedResponses = new Set();
+const prevIdAndResponse: [string, ChatCompletionMessageParam[]] = ["", [{
+  role: "developer",
+  content: ""
+}]];
 
 type AgentLoopParams = {
   model: string;
@@ -263,6 +266,7 @@ export class AgentLoop {
         session_id: this.sessionId,
       },
       ...(timeoutMs !== undefined ? { timeout: timeoutMs } : {}),
+      maxRetries: 50
     });
 
     setSessionId(this.sessionId);
@@ -447,6 +451,7 @@ export class AgentLoop {
       }
 
       let turnInput = [...abortOutputs, ...input];
+      // let turnInput = [...input];
 
       this.onLoading(true);
 
@@ -492,10 +497,20 @@ export class AgentLoop {
         return reduce(previous, choice.delta) as ChatCompletionMessage;
       };
       const CHUNK_DELAY_MS = 100;
-      const messageStack: ChatCompletionMessageParam[] = [{
+      let messageStack: ChatCompletionMessageParam[] = [{
         role: "developer",
         content: ""
-      }] // TODO: maintain the stack
+      }];
+
+      if (prevIdAndResponse[0] !== lastResponseId) {
+        prevIdAndResponse[0] = lastResponseId;
+        prevIdAndResponse[1] = [{
+          role: "developer",
+          content: ""
+        }];
+      } else {
+        messageStack = prevIdAndResponse[1];
+      }
 
       const staged: Array<ResponseItem | undefined> = [];
       const stageItem = (item: ResponseItem) => {
@@ -537,11 +552,24 @@ export class AgentLoop {
         for (const item of turnInput) {
           stageItem(item as ResponseItem);
         }
+
+        // Convert turnInput ResponseInputItems into ChatCompletionMessageParam
+        for (const ric of turnInput) {
+          if (ric.type === 'message') {
+            const msg = ric as ResponseItem;
+            const content = msg.content.map((c: { text: string }) => c.text).join('');
+            messageStack.push({ role: msg.role as 'user' | 'assistant', content: content });
+          } else if (ric.type === 'function_call_output') {
+            const func = ric as ResponseInputItem.FunctionCallOutput & { name?: string };
+            messageStack.push({ role: 'tool', tool_call_id: func.call_id, content: func.output });
+          }
+        }
+
         // Send request to OpenAI with retry on timeout
         let stream;
 
         // Retry loop for transient errors. Up to MAX_RETRIES attempts.
-        const MAX_RETRIES = 5;
+        const MAX_RETRIES = 50;
         for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
           try {
             let reasoning: Reasoning | undefined;
@@ -558,6 +586,13 @@ export class AgentLoop {
               log(
                 `instructions (length ${mergedInstructions.length}): ${mergedInstructions}`,
               );
+              log(
+                `messageStack (length ${messageStack.length}): ${JSON.stringify(
+                  messageStack,
+                  null,
+                  2,
+                )}`,
+              )
             }
             // eslint-disable-next-line no-await-in-loop
             // stream = await this.oai.responses.create({
@@ -596,10 +631,6 @@ export class AgentLoop {
             //   ],
             // });
             messageStack[0].content = mergedInstructions;
-            messageStack.push({
-              role: "user",
-              content: turnInput, //TODO: Input should be a string
-            });
             // eslint-disable-next-line no-await-in-loop
             stream = await this.oai.chat.completions.create({
               model: this.model,
@@ -632,7 +663,8 @@ export class AgentLoop {
                 },
               ],
               tool_choice: "auto",
-              stream: true,
+              stream: true
+              // timeout: OPENAI_TIMEOUT_MS
             });
             break;
           } catch (error) {
@@ -653,6 +685,11 @@ export class AgentLoop {
             const status =
               errCtx?.status ?? errCtx?.httpStatus ?? errCtx?.statusCode;
             const isServerError = typeof status === "number" && status >= 500;
+            if (isLoggingEnabled()) {
+              log(
+                `OpenAI request failed (attempt ${attempt}/${MAX_RETRIES}): the error type is ${isTimeout}, ${isServerError}, ${isConnectionError}, ${status}, ${errCtx.cause}, ${errCtx.info}, ${errCtx.message}`,
+              );
+            }
             if (
               (isTimeout || isServerError || isConnectionError) &&
               attempt < MAX_RETRIES
@@ -873,7 +910,7 @@ export class AgentLoop {
           // }
 
           // eslint-disable-next-line no-await-in-loop
-          let message = {} as ChatCompletionMessage;
+          let assistantMessage = {} as ChatCompletionMessage;
           let respId = "";
           for await (const chunk of stream) {
             if (respId === "") {
@@ -883,19 +920,43 @@ export class AgentLoop {
               log(`AgentLoop.run(): response chunk ${chunk.choices[0].finish_reason}`);
             }
 
-            message = messageReducer(message, chunk);
+            assistantMessage = messageReducer(assistantMessage, chunk);
             await new Promise((resolve) => setTimeout(resolve, CHUNK_DELAY_MS));
           }
-          messageStack.push(message);
+          messageStack.push(assistantMessage);
+
+          // Push assistant response into messageStack
+          // if (assistantMessage.tool_calls && assistantMessage.tool_calls.length > 0) {
+          //   // Function call by assistant
+          //   const call = assistantMessage.tool_calls[0];
+          //   messageStack.push({
+          //     role: 'assistant',
+          //     content: assistantMessage.content ?? '',
+          //     tool_calls: [{
+          //       function: {
+          //         name: call.function.name,
+          //         arguments: call.function.arguments
+          //       },
+          //       type: "function",
+          //       id: call.id
+          //     }]
+          //   });
+          // } else if (assistantMessage.content) {
+          //   messageStack.push({ role: 'assistant', content: assistantMessage.content });
+          // }
+
+          // Set prevIdAndResponse
+          prevIdAndResponse[0] = respId;
+          prevIdAndResponse[1] = messageStack;
 
           let respItemArray: Array<ResponseItem> = []
-          if (message.content) {
+          if (assistantMessage.content) {
             respItemArray.push({
               id: respId,
               content: [
                 {
-                  annotations: message.annotations ? message.annotations : [],
-                  text: message.content,
+                  annotations: assistantMessage.annotations ? assistantMessage.annotations : [],
+                  text: assistantMessage.content,
                   type: "output_text"
                 },
               ],
@@ -905,8 +966,8 @@ export class AgentLoop {
             } as ResponseItem);
           }
 
-          if (message.tool_calls) {
-            for (const tool_call of message.tool_calls) {
+          if (assistantMessage.tool_calls) {
+            for (const tool_call of assistantMessage.tool_calls) {
               respItemArray.push({
                 id: respId,
                 call_id: tool_call.id,
@@ -1121,6 +1182,11 @@ export class AgentLoop {
       })();
 
       if (isNetworkOrServerError) {
+        if (isLoggingEnabled()) {
+          log(
+            `AgentLoop.run(): network error (${err}) while contacting OpenAI`,
+          );
+        }
         try {
           const msgText =
             "⚠️  Network error while contacting OpenAI. Please check your connection and try again.";

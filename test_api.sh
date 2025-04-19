@@ -2,7 +2,7 @@ curl https://svip.xty.app/v1/chat/completions \
 -H "Content-Type: application/json" \
 -H "Authorization: Bearer sk-" \
 -d '{
-  "model": "gpt-4o",
+  "model": "gpt-4.1-mini-2025-04-14",
   "messages": [
     {
       "role": "user",
